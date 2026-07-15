@@ -11,18 +11,23 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-VERIFICATION_TOKEN = os.environ.get("EBAY_VERIFICATION_TOKEN", "5bf2e15aab5625ad37a4cd8e4646971cbae66596a557ea1e7c095b3c8fae43f2")
-ENDPOINT_URL = os.environ.get("EBAY_ENDPOINT_URL", "")
+_DEFAULT_ENDPOINT = "https://ebay-webhook-75c6.onrender.com/ebay/marketplace-deletion"
+_DEFAULT_TOKEN = "5bf2e15aab5625ad37a4cd8e4646971cbae66596a557ea1e7c095b3c8fae43f2"
 
 
 @app.route("/ebay/marketplace-deletion", methods=["GET", "POST"])
 def marketplace_deletion():
+    verification_token = os.environ.get("EBAY_VERIFICATION_TOKEN", _DEFAULT_TOKEN)
+    endpoint_url = os.environ.get("EBAY_ENDPOINT_URL", _DEFAULT_ENDPOINT) or _DEFAULT_ENDPOINT
+
     if request.method == "GET":
         challenge_code = request.args.get("challenge_code", "")
         if not challenge_code:
             return jsonify({"error": "missing challenge_code"}), 400
-        hash_input = challenge_code + VERIFICATION_TOKEN + ENDPOINT_URL
+
+        hash_input = challenge_code + verification_token + endpoint_url
         challenge_response = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+        print(f"[eBay] challenge={challenge_code[:16]}... ep={endpoint_url} resp={challenge_response[:16]}...")
         return jsonify({"challengeResponse": challenge_response})
 
     data = request.get_json(silent=True) or {}
