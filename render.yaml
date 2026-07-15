@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: assetflowco-ebay-webhook
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn webhook:app
+    envVars:
+      - key: EBAY_VERIFICATION_TOKEN
+        value: 5bf2e15aab5625ad37a4cd8e4646971cbae66596a557ea1e7c095b3c8fae43f2
+      - key: EBAY_ENDPOINT_URL
+        value: ""
