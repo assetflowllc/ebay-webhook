@@ -21,13 +21,14 @@ app = Flask(__name__)
 _DEFAULT_ENDPOINT = "https://ebay-webhook-75c6.onrender.com/ebay/marketplace-deletion"
 _DEFAULT_TOKEN = "5bf2e15aab5625ad37a4cd8e4646971cbae66596a557ea1e7c095b3c8fae43f2"
 
-# eBay API credentials (hardcoded for convenience - single-user private server)
+# eBay API credentials (hardcoded for convenience — single-user private server)
 EBAY_APP_ID = "Oleksand-undefine-PRD-7625861e4-44e64d91"
 EBAY_DEV_ID = "49416522-1c90-4f39-bdce-1f86662f19d0"
 EBAY_CERT_ID = "PRD-625861e4a624-0bf0-467f-bf73-4959"
 EBAY_RU_NAME = "Oleksandr_Karma-Oleksand-undefi-gbjsj"
 EBAY_API_URL = "https://api.ebay.com/ws/api.dll"
 
+# In-memory session storage (single-user, single-instance server)
 _store = {}
 
 
@@ -46,6 +47,10 @@ def _trading_api_headers(call_name):
 def _xml_text(root, tag, ns="urn:ebay:apis:eBLBaseComponents"):
     return root.findtext(f"{{{ns}}}{tag}")
 
+
+# ---------------------------------------------------------------------------
+# eBay Marketplace Account Deletion
+# ---------------------------------------------------------------------------
 
 @app.route("/ebay/marketplace-deletion", methods=["GET", "POST"])
 def marketplace_deletion():
@@ -66,13 +71,18 @@ def marketplace_deletion():
     return "", 200
 
 
+# ---------------------------------------------------------------------------
+# Auth'n'Auth token flow
+# ---------------------------------------------------------------------------
+
 @app.route("/auth/session", methods=["GET"])
 def auth_session():
+    """Step 1: Call GetSessionID, return sign-in URL for the user to visit."""
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <GetSessionIDRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials><eBayAuthToken></eBayAuthToken></RequesterCredentials>
   <RuName>{EBAY_RU_NAME}</RuName>
 </GetSessionIDRequest>"""
+
     try:
         resp = requests.post(EBAY_API_URL, data=xml.encode("utf-8"),
                              headers=_trading_api_headers("GetSessionID"), timeout=15)
@@ -81,53 +91,82 @@ def auth_session():
         if ack not in ("Success", "Warning"):
             errors = [e.text for e in root.findall(".//{urn:ebay:apis:eBLBaseComponents}ShortMessage")]
             return jsonify({"error": "GetSessionID failed", "details": errors, "raw": resp.text}), 500
+
         session_id = _xml_text(root, "SessionID")
         if not session_id:
             return jsonify({"error": "No SessionID in response", "raw": resp.text}), 500
+
         _store["session_id"] = session_id
-        sign_in_url = f"https://signin.ebay.com/ws/eBayISAPI.dll?SignIn&runame={EBAY_RU_NAME}&SessID={session_id}"
-        return jsonify({"session_id": session_id, "sign_in_url": sign_in_url,
-                        "instructions": "1. Open sign_in_url and sign in as assetflowco. 2. Click Agree and Continue. 3. Visit /auth/callback."})
+        sign_in_url = (
+            f"https://signin.ebay.com/ws/eBayISAPI.dll"
+            f"?SignIn&runame={EBAY_RU_NAME}&SessID={session_id}"
+        )
+        return jsonify({
+            "session_id": session_id,
+            "sign_in_url": sign_in_url,
+            "instructions": (
+                "1. Open sign_in_url in your browser and sign in with eBay account assetflowco. "
+                "2. Click 'Agree and Continue'. "
+                "3. Then visit /auth/callback to retrieve your token."
+            ),
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/auth/callback", methods=["GET"])
 def auth_callback():
+    """Step 2: Call FetchToken and display the eBayAuthToken."""
     session_id = _store.get("session_id") or request.args.get("SessionID") or request.args.get("session_id")
     if not session_id:
-        return jsonify({"error": "No session_id. Visit /auth/session first.", "args": dict(request.args)}), 400
+        return jsonify({
+            "error": "No session_id found. Visit /auth/session first.",
+            "args": dict(request.args),
+        }), 400
+
     xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <FetchTokenRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials><eBayAuthToken></eBayAuthToken></RequesterCredentials>
   <SessionID>{session_id}</SessionID>
 </FetchTokenRequest>"""
+
     try:
         resp = requests.post(EBAY_API_URL, data=xml.encode("utf-8"),
                              headers=_trading_api_headers("FetchToken"), timeout=15)
         root = ET.fromstring(resp.text)
+        ack = _xml_text(root, "Ack")
         token = _xml_text(root, "eBayAuthToken")
         expiration = _xml_text(root, "HardExpirationTime")
+
         if token:
             _store["ebay_token"] = token
-            return (f"<html><body style='font-family:monospace;padding:20px'>"
-                    f"<h2>&#10003; Token Retrieved!</h2>"
-                    f"<p><strong>Copy this token:</strong></p>"
-                    f"<textarea rows='6' cols='90'>{token}</textarea>"
-                    f"<p>Expires: {expiration}</p></body></html>")
+            return (
+                f"<html><body style='font-family:monospace;padding:20px'>"
+                f"<h2>&#10003; eBay Auth Token Retrieved!</h2>"
+                f"<p><strong>Token — copy this entire string:</strong></p>"
+                f"<textarea rows='6' cols='90' style='font-size:12px'>{token}</textarea>"
+                f"<p>Expires: {expiration}</p>"
+                f"<p>Paste it into <code>nellis_to_ebay.py</code> as <code>EBAY_TOKEN = \"...\"</code></p>"
+                f"</body></html>"
+            )
+
         errors = [e.text for e in root.findall(".//{urn:ebay:apis:eBLBaseComponents}ShortMessage")]
-        return jsonify({"error": "FetchToken failed", "details": errors, "raw": resp.text}), 500
+        return jsonify({"error": "FetchToken failed", "details": errors, "ack": ack, "raw": resp.text}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/auth/token", methods=["GET"])
 def auth_token():
+    """View the token stored in memory (survives only while the process is running)."""
     token = _store.get("ebay_token")
     if token:
         return jsonify({"ebay_token": token})
-    return jsonify({"error": "No token yet."}), 404
+    return jsonify({"error": "No token yet. Complete /auth/session -> sign in -> /auth/callback first."}), 404
 
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
 
 @app.route("/health", methods=["GET"])
 def health():
