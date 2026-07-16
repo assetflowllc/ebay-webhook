@@ -21,7 +21,7 @@ app = Flask(__name__)
 _DEFAULT_ENDPOINT = "https://ebay-webhook-75c6.onrender.com/ebay/marketplace-deletion"
 _DEFAULT_TOKEN = "5bf2e15aab5625ad37a4cd8e4646971cbae66596a557ea1e7c095b3c8fae43f2"
 
-# eBay API credentials (hardcoded for convenience — single-user private server)
+# eBay API credentials (hardcoded for convenience â single-user private server)
 EBAY_APP_ID = "Oleksand-undefine-PRD-7625861e4-44e64d91"
 EBAY_DEV_ID = "49416522-1c90-4f39-bdce-1f86662f19d0"
 EBAY_CERT_ID = "PRD-625861e4a624-0bf0-467f-bf73-4959"
@@ -142,7 +142,7 @@ def auth_callback():
             return (
                 f"<html><body style='font-family:monospace;padding:20px'>"
                 f"<h2>&#10003; eBay Auth Token Retrieved!</h2>"
-                f"<p><strong>Token — copy this entire string:</strong></p>"
+                f"<p><strong>Token â copy this entire string:</strong></p>"
                 f"<textarea rows='6' cols='90' style='font-size:12px'>{token}</textarea>"
                 f"<p>Expires: {expiration}</p>"
                 f"<p>Paste it into <code>nellis_to_ebay.py</code> as <code>EBAY_TOKEN = \"...\"</code></p>"
@@ -161,7 +161,7 @@ def auth_token():
     token = _store.get("ebay_token")
     if token:
         return jsonify({"ebay_token": token})
-    return jsonify({"error": "No token yet. Complete /auth/session -> sign in -> /auth/callback first."}), 404
+    return jsonify({"error": "No token yet. Complete /auth/session â sign in â /auth/callback first."}), 404
 
 
 # ---------------------------------------------------------------------------
@@ -191,11 +191,12 @@ def publish():
         title = (item.get("title") or "")[:80]
         description = item.get("description") or ""
         category_id = item.get("category_id", "99")
-        condition_id = item.get("condition_id", 1000)
+        condition_id = item.get("condition_id") or None  # None = omit from XML
         price = float(item.get("price", 19.99))
         images = item.get("images", [])[:12]
         specifics = item.get("item_specifics", {})
         shipping_cost = float(item.get("shipping_cost", 9.99))
+        site_id = str(item.get("site_id", 0))
 
         img_xml = "\n".join(f"      <PictureURL>{u}</PictureURL>" for u in images)
 
@@ -210,6 +211,8 @@ def publish():
                 f"</NameValueList>"
             )
 
+        condition_xml = f"\n    <ConditionID>{condition_id}</ConditionID>" if condition_id else ""
+
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <AddItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
   <RequesterCredentials><eBayAuthToken>{token}</eBayAuthToken></RequesterCredentials>
@@ -220,8 +223,7 @@ def publish():
     <StartPrice>{price:.2f}</StartPrice>
     <Quantity>1</Quantity>
     <ListingType>FixedPriceItem</ListingType>
-    <ListingDuration>GTC</ListingDuration>
-    <ConditionID>{condition_id}</ConditionID>
+    <ListingDuration>GTC</ListingDuration>{condition_xml}
     <Country>US</Country>
     <Currency>USD</Currency>
     <Location>Denver, CO</Location>
@@ -240,11 +242,14 @@ def publish():
   </Item>
 </AddItemRequest>"""
 
+        item_headers = _trading_api_headers("AddItem")
+        item_headers["X-EBAY-API-SITEID"] = site_id
+
         try:
             resp = requests.post(
                 EBAY_API_URL,
                 data=xml.encode("utf-8"),
-                headers=_trading_api_headers("AddItem"),
+                headers=item_headers,
                 timeout=30,
             )
             root = ET.fromstring(resp.text)
@@ -276,6 +281,157 @@ def publish():
 
     ok = sum(1 for r in results if r["success"])
     return jsonify({"published": ok, "total": len(results), "results": results})
+
+
+# ---------------------------------------------------------------------------
+# eBay Negotiation API proxy (Send Offer to Buyers)
+# ---------------------------------------------------------------------------
+
+EBAY_NEGOTIATION_BASE = "https://api.ebay.com/sell/negotiation/v1"
+
+
+def _negotiation_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "X-EBAY-C-MARKETPLACE-ID": "EBAY_US",
+    }
+
+
+@app.route("/negotiation/eligible", methods=["GET"])
+def negotiation_eligible():
+    """
+    GET /negotiation/eligible?token=...
+    Returns all listings eligible for Send Offer to Buyers.
+    """
+    token = request.args.get("token") or _store.get("ebay_token")
+    if not token:
+        return jsonify({"error": "No token"}), 400
+
+    all_items = []
+    offset = 0
+    limit = 200
+
+    while True:
+        resp = requests.get(
+            f"{EBAY_NEGOTIATION_BASE}/find_eligible_items",
+            headers=_negotiation_headers(token),
+            params={"limit": limit, "offset": offset},
+            timeout=15,
+        )
+        if resp.status_code == 204:
+            break
+        if not resp.ok:
+            return jsonify({"error": resp.status_code, "detail": resp.text[:500]}), resp.status_code
+
+        data = resp.json()
+        items = data.get("eligibleItems", [])
+        all_items.extend(items)
+        if len(all_items) >= data.get("total", 0):
+            break
+        offset += limit
+
+    return jsonify({"total": len(all_items), "items": all_items})
+
+
+@app.route("/negotiation/send_offers", methods=["POST"])
+def negotiation_send_offers():
+    """
+    POST JSON: {"token": "...", "discount_pct": 10, "expiry_days": 2, "dry_run": false}
+    Finds all eligible listings and sends discount offers to buyers.
+    Returns {"sent": N, "errors": N, "results": [...]}
+    """
+    body = request.get_json(silent=True) or {}
+    token = body.get("token") or _store.get("ebay_token")
+    if not token:
+        return jsonify({"error": "No token"}), 400
+
+    discount_pct = int(body.get("discount_pct", 10))
+    expiry_days = int(body.get("expiry_days", 2))
+    auto_accept_pct = int(body.get("auto_accept_pct", 5))
+    dry_run = bool(body.get("dry_run", False))
+
+    # 1. Find eligible items
+    all_items = []
+    offset = 0
+    while True:
+        resp = requests.get(
+            f"{EBAY_NEGOTIATION_BASE}/find_eligible_items",
+            headers=_negotiation_headers(token),
+            params={"limit": 200, "offset": offset},
+            timeout=15,
+        )
+        if resp.status_code == 204:
+            break
+        if not resp.ok:
+            return jsonify({"error": "find_eligible_items failed",
+                            "status": resp.status_code, "detail": resp.text[:500]}), 502
+        data = resp.json()
+        items = data.get("eligibleItems", [])
+        all_items.extend(items)
+        if len(all_items) >= data.get("total", 0):
+            break
+        offset += 200
+
+    if not all_items:
+        return jsonify({"message": "No eligible listings found", "sent": 0, "errors": 0, "results": []})
+
+    # 2. Send offers
+    results = []
+    import time as _time
+    for item in all_items:
+        listing_id = item.get("listingId")
+        title = (item.get("listingTitle") or "")[:60]
+        price_val = float((item.get("price") or {}).get("value", 0))
+        currency = (item.get("price") or {}).get("currency", "USD")
+        offer_price = round(price_val * (1 - discount_pct / 100), 2)
+        auto_accept = round(price_val * (1 - auto_accept_pct / 100), 2)
+
+        if dry_run:
+            results.append({
+                "listing_id": listing_id, "title": title,
+                "original": price_val, "offer": offer_price,
+                "dry_run": True, "success": True,
+            })
+            continue
+
+        offer_resp = requests.post(
+            f"{EBAY_NEGOTIATION_BASE}/send_offer_to_buyers",
+            headers=_negotiation_headers(token),
+            json={
+                "listingId": listing_id,
+                "offers": [{
+                    "price": {"value": str(offer_price), "currency": currency},
+                    "offerDuration": {"value": expiry_days, "unit": "DAY"},
+                    "offerMessage": (
+                        f"Hi! We noticed your interest in this item. "
+                        f"Here's an exclusive {discount_pct}% discount â "
+                        f"offer valid for {expiry_days} days. Enjoy!"
+                    ),
+                    "autoAcceptPrice": {"value": str(auto_accept), "currency": currency},
+                }],
+            },
+            timeout=15,
+        )
+
+        if offer_resp.ok:
+            results.append({
+                "listing_id": listing_id, "title": title,
+                "original": price_val, "offer": offer_price,
+                "success": True,
+            })
+        else:
+            results.append({
+                "listing_id": listing_id, "title": title,
+                "success": False,
+                "error": offer_resp.status_code,
+                "detail": offer_resp.text[:300],
+            })
+        _time.sleep(0.3)
+
+    sent = sum(1 for r in results if r["success"])
+    errors = len(results) - sent
+    return jsonify({"sent": sent, "errors": errors, "total": len(results), "results": results})
 
 
 # ---------------------------------------------------------------------------
