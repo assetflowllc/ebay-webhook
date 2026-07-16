@@ -21,7 +21,7 @@ app = Flask(__name__)
 _DEFAULT_ENDPOINT = "https://ebay-webhook-75c6.onrender.com/ebay/marketplace-deletion"
 _DEFAULT_TOKEN = "5bf2e15aab5625ad37a4cd8e4646971cbae66596a557ea1e7c095b3c8fae43f2"
 
-# eBay API credentials (hardcoded for convenience — single-user private server)
+# eBay API credentials (hardcoded for convenience â single-user private server)
 EBAY_APP_ID = "Oleksand-undefine-PRD-7625861e4-44e64d91"
 EBAY_DEV_ID = "49416522-1c90-4f39-bdce-1f86662f19d0"
 EBAY_CERT_ID = "PRD-625861e4a624-0bf0-467f-bf73-4959"
@@ -142,7 +142,7 @@ def auth_callback():
             return (
                 f"<html><body style='font-family:monospace;padding:20px'>"
                 f"<h2>&#10003; eBay Auth Token Retrieved!</h2>"
-                f"<p><strong>Token — copy this entire string:</strong></p>"
+                f"<p><strong>Token â copy this entire string:</strong></p>"
                 f"<textarea rows='6' cols='90' style='font-size:12px'>{token}</textarea>"
                 f"<p>Expires: {expiration}</p>"
                 f"<p>Paste it into <code>nellis_to_ebay.py</code> as <code>EBAY_TOKEN = \"...\"</code></p>"
@@ -161,7 +161,120 @@ def auth_token():
     token = _store.get("ebay_token")
     if token:
         return jsonify({"ebay_token": token})
-    return jsonify({"error": "No token yet. Complete /auth/session -> sign in -> /auth/callback first."}), 404
+    return jsonify({"error": "No token yet. Complete /auth/session â sign in â /auth/callback first."}), 404
+
+
+# ---------------------------------------------------------------------------
+# eBay AddItem publisher (called from local machine via this proxy)
+# ---------------------------------------------------------------------------
+
+@app.route("/publish", methods=["POST"])
+def publish():
+    """
+    POST JSON: {"token": "...", "listings": [...]}
+    Each listing: {title, description, category_id, condition_id, price,
+                   images, item_specifics, shipping_cost}
+    Returns: {"results": [{title, item_id, url, success, errors}]}
+    """
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "JSON body required"}), 400
+
+    token = body.get("token") or _store.get("ebay_token")
+    if not token:
+        return jsonify({"error": "No token. Provide 'token' in body or complete /auth/session flow."}), 400
+
+    listings = body.get("listings", [])
+    results = []
+
+    for item in listings:
+        title = (item.get("title") or "")[:80]
+        description = item.get("description") or ""
+        category_id = item.get("category_id", "99")
+        condition_id = item.get("condition_id", 1000)
+        price = float(item.get("price", 19.99))
+        images = item.get("images", [])[:12]
+        specifics = item.get("item_specifics", {})
+        shipping_cost = float(item.get("shipping_cost", 9.99))
+
+        img_xml = "\n".join(f"      <PictureURL>{u}</PictureURL>" for u in images)
+
+        specifics_xml = ""
+        for k, v in specifics.items():
+            k_s = str(k).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            v_s = str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            specifics_xml += (
+                f"\n      <NameValueList>"
+                f"<Name>{k_s}</Name>"
+                f"<Value>{v_s}</Value>"
+                f"</NameValueList>"
+            )
+
+        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<AddItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>{token}</eBayAuthToken></RequesterCredentials>
+  <Item>
+    <Title><![CDATA[{title}]]></Title>
+    <Description><![CDATA[{description}]]></Description>
+    <PrimaryCategory><CategoryID>{category_id}</CategoryID></PrimaryCategory>
+    <StartPrice>{price:.2f}</StartPrice>
+    <Quantity>1</Quantity>
+    <ListingType>FixedPriceItem</ListingType>
+    <ListingDuration>GTC</ListingDuration>
+    <ConditionID>{condition_id}</ConditionID>
+    <Country>US</Country>
+    <Currency>USD</Currency>
+    <DispatchTimeMax>2</DispatchTimeMax>
+    <PictureDetails>{img_xml}</PictureDetails>
+    <ItemSpecifics>{specifics_xml}</ItemSpecifics>
+    <ShipToLocations>US</ShipToLocations>
+    <ReturnPolicy><ReturnsAcceptedOption>ReturnsNotAccepted</ReturnsAcceptedOption></ReturnPolicy>
+    <ShippingDetails>
+      <ShippingServiceOptions>
+        <ShippingServicePriority>1</ShippingServicePriority>
+        <ShippingService>USPSPriority</ShippingService>
+        <ShippingServiceCost>{shipping_cost:.2f}</ShippingServiceCost>
+      </ShippingServiceOptions>
+    </ShippingDetails>
+  </Item>
+</AddItemRequest>"""
+
+        try:
+            resp = requests.post(
+                EBAY_API_URL,
+                data=xml.encode("utf-8"),
+                headers=_trading_api_headers("AddItem"),
+                timeout=30,
+            )
+            root = ET.fromstring(resp.text)
+            ns = "urn:ebay:apis:eBLBaseComponents"
+            ack = _xml_text(root, "Ack")
+            item_id = _xml_text(root, "ItemID")
+            errors = [e.text for e in root.findall(f".//{{{ns}}}ShortMessage")]
+
+            if item_id:
+                results.append({
+                    "title": title,
+                    "item_id": item_id,
+                    "url": f"https://www.ebay.com/itm/{item_id}",
+                    "success": True,
+                })
+            else:
+                results.append({
+                    "title": title,
+                    "success": False,
+                    "ack": ack,
+                    "errors": errors,
+                    "raw": resp.text[:500],
+                })
+        except Exception as e:
+            results.append({"title": title, "success": False, "errors": [str(e)]})
+
+        import time
+        time.sleep(0.3)
+
+    ok = sum(1 for r in results if r["success"])
+    return jsonify({"published": ok, "total": len(results), "results": results})
 
 
 # ---------------------------------------------------------------------------
