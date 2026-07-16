@@ -21,7 +21,7 @@ app = Flask(__name__)
 _DEFAULT_ENDPOINT = "https://ebay-webhook-75c6.onrender.com/ebay/marketplace-deletion"
 _DEFAULT_TOKEN = "5bf2e15aab5625ad37a4cd8e4646971cbae66596a557ea1e7c095b3c8fae43f2"
 
-# eBay API credentials (hardcoded for convenience â single-user private server)
+# eBay API credentials (hardcoded for convenience — single-user private server)
 EBAY_APP_ID = "Oleksand-undefine-PRD-7625861e4-44e64d91"
 EBAY_DEV_ID = "49416522-1c90-4f39-bdce-1f86662f19d0"
 EBAY_CERT_ID = "PRD-625861e4a624-0bf0-467f-bf73-4959"
@@ -142,7 +142,7 @@ def auth_callback():
             return (
                 f"<html><body style='font-family:monospace;padding:20px'>"
                 f"<h2>&#10003; eBay Auth Token Retrieved!</h2>"
-                f"<p><strong>Token â copy this entire string:</strong></p>"
+                f"<p><strong>Token — copy this entire string:</strong></p>"
                 f"<textarea rows='6' cols='90' style='font-size:12px'>{token}</textarea>"
                 f"<p>Expires: {expiration}</p>"
                 f"<p>Paste it into <code>nellis_to_ebay.py</code> as <code>EBAY_TOKEN = \"...\"</code></p>"
@@ -161,7 +161,7 @@ def auth_token():
     token = _store.get("ebay_token")
     if token:
         return jsonify({"ebay_token": token})
-    return jsonify({"error": "No token yet. Complete /auth/session â sign in â /auth/callback first."}), 404
+    return jsonify({"error": "No token yet. Complete /auth/session -> sign in -> /auth/callback first."}), 404
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +224,7 @@ def publish():
     <ConditionID>{condition_id}</ConditionID>
     <Country>US</Country>
     <Currency>USD</Currency>
+    <Location>Denver, CO</Location>
     <DispatchTimeMax>2</DispatchTimeMax>
     <PictureDetails>{img_xml}</PictureDetails>
     <ItemSpecifics>{specifics_xml}</ItemSpecifics>
