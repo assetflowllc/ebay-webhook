@@ -9,12 +9,15 @@ Also provides Auth'n'Auth token flow endpoints:
   GET /auth/token    -> View stored token
 """
 
+import base64 as _base64
 import hashlib
 import json
 import os
+import time as _time_mod
+import urllib.parse
 import requests
 from xml.etree import ElementTree as ET
-from flask import Flask, request, jsonify
+from flask import Flask, redirect, request, jsonify
 
 app = Flask(__name__)
 
@@ -28,8 +31,53 @@ EBAY_CERT_ID = "PRD-625861e4a624-0bf0-467f-bf73-4959"
 EBAY_RU_NAME = "Oleksandr_Karma-Oleksand-undefi-gbjsj"
 EBAY_API_URL = "https://api.ebay.com/ws/api.dll"
 
+# OAuth 2.0 (for REST APIs like Sell Negotiation)
+EBAY_OAUTH_TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+EBAY_OAUTH_SCOPES = " ".join([
+    "https://api.ebay.com/oauth/api_scope",
+    "https://api.ebay.com/oauth/api_scope/sell.negotiation",
+    "https://api.ebay.com/oauth/api_scope/sell.inventory",
+    "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
+])
+
 # In-memory session storage (single-user, single-instance server)
 _store = {}
+
+
+def _oauth_basic_auth() -> str:
+    """Base64-encoded Client ID:Client Secret for OAuth token endpoint."""
+    creds = f"{EBAY_APP_ID}:{EBAY_CERT_ID}"
+    return _base64.b64encode(creds.encode()).decode()
+
+
+def _get_oauth_token() -> str:
+    """Return stored OAuth access token, refreshing if expired."""
+    token = _store.get("oauth_access_token")
+    expires_at = _store.get("oauth_expires_at", 0)
+    if token and _time_mod.time() < expires_at - 60:
+        return token
+    # Try to refresh
+    refresh_token = _store.get("oauth_refresh_token")
+    if refresh_token:
+        resp = requests.post(
+            EBAY_OAUTH_TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {_oauth_basic_auth()}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": EBAY_OAUTH_SCOPES,
+            },
+            timeout=15,
+        )
+        if resp.ok:
+            data = resp.json()
+            _store["oauth_access_token"] = data.get("access_token", "")
+            _store["oauth_expires_at"] = _time_mod.time() + data.get("expires_in", 7200)
+            return _store["oauth_access_token"]
+    return token or ""
 
 
 def _trading_api_headers(call_name):
@@ -116,7 +164,49 @@ def auth_session():
 
 @app.route("/auth/callback", methods=["GET"])
 def auth_callback():
-    """Step 2: Call FetchToken and display the eBayAuthToken."""
+    """Handles both OAuth 2.0 authorization code callback and Auth'n'Auth FetchToken."""
+    # --- OAuth 2.0 path (eBay redirects here with ?code=...) ---
+    code = request.args.get("code")
+    if code:
+        try:
+            resp = requests.post(
+                EBAY_OAUTH_TOKEN_URL,
+                headers={
+                    "Authorization": f"Basic {_oauth_basic_auth()}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": EBAY_RU_NAME,
+                },
+                timeout=15,
+            )
+            if resp.ok:
+                data = resp.json()
+                access_token = data.get("access_token", "")
+                refresh_token = data.get("refresh_token", "")
+                expires_in = data.get("expires_in", 7200)
+                _store["oauth_access_token"] = access_token
+                _store["oauth_refresh_token"] = refresh_token
+                _store["oauth_expires_at"] = _time_mod.time() + expires_in
+                return (
+                    f"<html><body style='font-family:monospace;padding:20px'>"
+                    f"<h2>&#10003; OAuth Token Retrieved!</h2>"
+                    f"<p><strong>Access Token (first 40 chars):</strong><br>"
+                    f"<code>{access_token[:40]}...</code></p>"
+                    f"<p>Expires in: {expires_in}s (~{expires_in//3600}h)</p>"
+                    f"<p>Refresh token stored: {'YES' if refresh_token else 'NO'}</p>"
+                    f"<p>Token is stored in memory. Use "
+                    f"<a href='/negotiation/eligible'>/negotiation/eligible</a> to test.</p>"
+                    f"</body></html>"
+                )
+            else:
+                return jsonify({"error": resp.status_code, "detail": resp.text[:500]}), 400
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # --- Auth'n'Auth path (legacy) ---
     session_id = _store.get("session_id") or request.args.get("SessionID") or request.args.get("session_id")
     if not session_id:
         return jsonify({
@@ -304,7 +394,7 @@ def negotiation_eligible():
     GET /negotiation/eligible?token=...
     Returns all listings eligible for Send Offer to Buyers.
     """
-    token = request.args.get("token") or _store.get("ebay_token")
+    token = request.args.get("token") or _get_oauth_token() or _store.get("ebay_token")
     if not token:
         return jsonify({"error": "No token"}), 400
 
@@ -342,9 +432,9 @@ def negotiation_send_offers():
     Returns {"sent": N, "errors": N, "results": [...]}
     """
     body = request.get_json(silent=True) or {}
-    token = body.get("token") or _store.get("ebay_token")
+    token = body.get("token") or _get_oauth_token() or _store.get("ebay_token")
     if not token:
-        return jsonify({"error": "No token"}), 400
+        return jsonify({"error": "No token. Visit /oauth/start to authorize."}), 400
 
     discount_pct = int(body.get("discount_pct", 10))
     expiry_days = int(body.get("expiry_days", 2))
@@ -432,6 +522,71 @@ def negotiation_send_offers():
     sent = sum(1 for r in results if r["success"])
     errors = len(results) - sent
     return jsonify({"sent": sent, "errors": errors, "total": len(results), "results": results})
+
+
+# ---------------------------------------------------------------------------
+# OAuth 2.0 management endpoints
+# ---------------------------------------------------------------------------
+
+@app.route("/oauth/start", methods=["GET"])
+def oauth_start():
+    """Redirect browser to eBay OAuth consent page. Visit this URL once to authorize."""
+    auth_url = "https://auth.ebay.com/oauth2/authorize?" + urllib.parse.urlencode({
+        "client_id": EBAY_APP_ID,
+        "redirect_uri": EBAY_RU_NAME,
+        "response_type": "code",
+        "scope": EBAY_OAUTH_SCOPES,
+    })
+    return redirect(auth_url)
+
+
+@app.route("/oauth/token", methods=["GET"])
+def oauth_token_view():
+    """Check status of stored OAuth token."""
+    token = _store.get("oauth_access_token")
+    expires_at = _store.get("oauth_expires_at", 0)
+    if not token:
+        return jsonify({
+            "error": "No OAuth token. Visit /oauth/start to authorize.",
+            "url": "https://ebay-webhook-75c6.onrender.com/oauth/start",
+        }), 404
+    remaining = int(expires_at - _time_mod.time())
+    return jsonify({
+        "status": "valid" if remaining > 0 else "expired",
+        "token_preview": token[:30] + "...",
+        "expires_in_seconds": max(remaining, 0),
+        "has_refresh_token": bool(_store.get("oauth_refresh_token")),
+    })
+
+
+@app.route("/oauth/refresh", methods=["POST"])
+def oauth_refresh():
+    """Force-refresh the OAuth access token using the stored refresh token."""
+    refresh_token = _store.get("oauth_refresh_token")
+    if not refresh_token:
+        return jsonify({"error": "No refresh token. Visit /oauth/start to re-authorize."}), 404
+    try:
+        resp = requests.post(
+            EBAY_OAUTH_TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {_oauth_basic_auth()}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": EBAY_OAUTH_SCOPES,
+            },
+            timeout=15,
+        )
+        if resp.ok:
+            data = resp.json()
+            _store["oauth_access_token"] = data.get("access_token", "")
+            _store["oauth_expires_at"] = _time_mod.time() + data.get("expires_in", 7200)
+            return jsonify({"status": "refreshed", "expires_in": data.get("expires_in", 7200)})
+        return jsonify({"error": resp.status_code, "detail": resp.text[:300]}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------------------------------------------------------
